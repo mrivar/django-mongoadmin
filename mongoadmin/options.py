@@ -1,19 +1,23 @@
 import collections
+import operator
 from functools import partial
 
 from django import forms
 from django.forms.models import modelform_defines_fields
 from django.contrib.admin.options import ModelAdmin, InlineModelAdmin, get_ul_class
 from django.contrib.admin import widgets
-from django.contrib.admin.util import flatten_fieldsets
-from django.core.exceptions import FieldError, ValidationError
+from django.contrib.admin.util import flatten_fieldsets, NestedObjects
+from django.contrib.admin.utils import lookup_needs_distinct
+from django.core.exceptions import FieldDoesNotExist, FieldError, ValidationError
+from django.db import models
+from django.db.models.constants import LOOKUP_SEP
 from django.forms.formsets import DELETION_FIELD_NAME
 from django.utils.translation import ugettext as _
-from django.contrib.admin.util import NestedObjects
 from django.utils.text import get_text_list
 
 from mongoengine.fields import (DateTimeField, URLField, IntField, ListField, EmbeddedDocumentField,
                                 ReferenceField, StringField, FileField, ImageField)
+from mongoengine.queryset.visitor import Q
 
 from mongodbforms.documents import documentform_factory, embeddedformset_factory, DocumentForm, EmbeddedDocumentFormSet, EmbeddedDocumentForm
 from mongodbforms.util import load_field_generator, init_document_options
@@ -346,6 +350,55 @@ class DocumentAdmin(MongoFormFieldMixin, ModelAdmin):
 
         super(DocumentAdmin, self).log_deletion(
             request=request, object=object, object_repr=object_repr)
+
+    def get_search_results(self, request, queryset, search_term):
+        """
+        Return a tuple containing a queryset to implement the search
+        and a boolean indicating if the results may contain duplicates.
+        """
+        # Apply keyword searches.
+        def construct_search(field_name):
+            if field_name.startswith('^'):
+                return "%s__istartswith" % field_name[1:]
+            elif field_name.startswith('='):
+                return "%s__iexact" % field_name[1:]
+            elif field_name.startswith('@'):
+                return "%s__search" % field_name[1:]
+            # Use field_name if it includes a lookup.
+            opts = queryset.model._meta
+            lookup_fields = field_name.split(LOOKUP_SEP)
+            # Go through the fields, following all relations.
+            prev_field = None
+            for path_part in lookup_fields:
+                if path_part == 'pk':
+                    path_part = opts.pk.name
+                try:
+                    field = opts.get_field(path_part)
+                except FieldDoesNotExist:
+                    # Use valid query lookups.
+                    if prev_field and prev_field.get_lookup(path_part):
+                        return field_name
+                else:
+                    prev_field = field
+                    if hasattr(field, 'get_path_info'):
+                        # Update opts to follow the relation.
+                        opts = field.get_path_info()[-1].to_opts
+            # Otherwise, use the field with icontains.
+            return "%s__icontains" % field_name
+
+        use_distinct = False
+        search_fields = self.get_search_fields(request)
+        if search_fields and search_term:
+            orm_lookups = [construct_search(str(search_field))
+                           for search_field in search_fields]
+            for bit in search_term.split():
+                # SUBSTITUTE DJANGO Q FOR MONGOENGINE Q
+                or_queries = [Q(**{orm_lookup: bit})
+                              for orm_lookup in orm_lookups]
+                queryset = queryset.filter(reduce(operator.or_, or_queries))
+            use_distinct |= any(lookup_needs_distinct(self.opts, search_spec) for search_spec in orm_lookups)
+
+        return queryset, use_distinct
 
 
 class EmbeddedInlineAdmin(MongoFormFieldMixin, InlineModelAdmin):
